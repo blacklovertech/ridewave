@@ -3,19 +3,20 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"ridewave/db"
 	"ridewave/models"
 	"ridewave/utils"
-)
 
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+)
 
 // RegisterUserRoutes defines all user-facing API endpoints
 func RegisterUserRoutes(r *gin.Engine, authMiddleware gin.HandlerFunc) {
@@ -37,8 +38,12 @@ func RegisterUserRoutes(r *gin.Engine, authMiddleware gin.HandlerFunc) {
 		// Ride Operations
 		userGroup.GET("/service-availability", authMiddleware, CheckServiceAvailability)
 		userGroup.GET("/places/autocomplete", authMiddleware, PlacesAutocomplete)
+		userGroup.GET("/places/reverse-geocode", authMiddleware, ReverseGeocode)
+		userGroup.GET("/places/details", authMiddleware, GetPlaceDetails)
 		userGroup.GET("/places/nearby", authMiddleware, NearbySearch)
 		userGroup.POST("/ride/estimate", authMiddleware, GetRideEstimate)
+		userGroup.POST("/ride/distance-matrix", authMiddleware, GetDistanceMatrix)
+
 		userGroup.POST("/ride/create", authMiddleware, CreateRide)
 		userGroup.POST("/ride/cancel", authMiddleware, CancelRide)
 		userGroup.GET("/ride/:id", authMiddleware, GetRideDetails)
@@ -48,6 +53,16 @@ func RegisterUserRoutes(r *gin.Engine, authMiddleware gin.HandlerFunc) {
 		userGroup.POST("/payment/verify-direct", authMiddleware, VerifyDirectPayment)
 		userGroup.POST("/rate-driver", authMiddleware, RateDriver)
 		userGroup.POST("/sos", authMiddleware, TriggerSOS)
+
+		// Ola Maps Advanced Features
+		userGroup.POST("/ola/geofence", authMiddleware, CreateGeofence)
+		userGroup.PUT("/ola/geofence/:id", authMiddleware, UpdateGeofence)
+		userGroup.GET("/ola/geofence/:id", authMiddleware, GetGeofence)
+		userGroup.DELETE("/ola/geofence/:id", authMiddleware, DeleteGeofence)
+		userGroup.GET("/ola/geofences", authMiddleware, ListGeofences)
+		userGroup.GET("/ola/geofence/status", authMiddleware, GetGeofenceStatus)
+		userGroup.POST("/ola/route-optimizer", authMiddleware, RouteOptimizer)
+		userGroup.POST("/ola/fleet-planner", authMiddleware, FleetPlanner)
 	}
 }
 
@@ -441,7 +456,7 @@ func VerifyDirectPayment(c *gin.Context) {
 	// 1. Validate Ride
 	var rideStatus string
 	var driverID *string
-	err := db.Pool.QueryRow(context.Background(), 
+	err := db.Pool.QueryRow(context.Background(),
 		`SELECT status, "driverId" FROM rides WHERE id=$1`, body.RideID).Scan(&rideStatus, &driverID)
 	if err != nil {
 		utils.RespondError(c, http.StatusNotFound, "Ride not found", err)
@@ -461,7 +476,7 @@ func VerifyDirectPayment(c *gin.Context) {
 	_, err = db.Pool.Exec(context.Background(),
 		`UPDATE rides SET "paymentStatus"='Paid', "paymentMode"=$1, "updatedAt"=NOW() WHERE id=$2`,
 		body.Mode, body.RideID)
-	
+
 	if err != nil {
 		utils.RespondError(c, http.StatusInternalServerError, "Failed to update ride payment status", err)
 		return
@@ -470,4 +485,241 @@ func VerifyDirectPayment(c *gin.Context) {
 	utils.RespondSuccess(c, http.StatusOK, "Payment recorded successfully", nil)
 }
 
+// ---------------------------------------------------------------------
+// New Ola Maps Features
+// ---------------------------------------------------------------------
 
+// GET /api/v1/user/places/reverse-geocode?lat=...&lng=...
+func ReverseGeocode(c *gin.Context) {
+	lat, errLat := strconv.ParseFloat(c.Query("lat"), 64)
+	lng, errLng := strconv.ParseFloat(c.Query("lng"), 64)
+
+	if errLat != nil || errLng != nil {
+		utils.RespondError(c, http.StatusBadRequest, "Invalid latitude or longitude", nil)
+		return
+	}
+
+	olaClient := utils.NewOlaMapsClient()
+	address, err := olaClient.ReverseGeocode(lat, lng)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Reverse geocoding failed", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Address found", gin.H{"address": address})
+}
+
+// GET /api/v1/user/places/details?placeId=...
+func GetPlaceDetails(c *gin.Context) {
+	placeID := c.Query("placeId")
+	if placeID == "" {
+		utils.RespondError(c, http.StatusBadRequest, "placeId is required", nil)
+		return
+	}
+
+	olaClient := utils.NewOlaMapsClient()
+	details, err := olaClient.GetPlaceDetails(placeID)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to fetch place details", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Place details", gin.H{"details": details})
+}
+
+// POST /api/v1/user/ride/distance-matrix
+func GetDistanceMatrix(c *gin.Context) {
+	var body struct {
+		Origins      []string `json:"origins" binding:"required"`
+		Destinations []string `json:"destinations" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.RespondError(c, http.StatusBadRequest, "Invalid request body", err)
+		return
+	}
+
+	olaClient := utils.NewOlaMapsClient()
+	matrix, err := olaClient.GetDistanceMatrix(body.Origins, body.Destinations)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Distance matrix failed", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Distance matrix", gin.H{"matrix": matrix})
+}
+
+// ---------------------------------------------------------------------
+// Ola Maps Advanced Handlers
+// ---------------------------------------------------------------------
+
+// POST /api/v1/user/ola/geofence
+func CreateGeofence(c *gin.Context) {
+	var body utils.GeofenceCreateRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.RespondError(c, http.StatusBadRequest, "Invalid request body", err)
+		return
+	}
+
+	olaClient := utils.NewOlaMapsClient()
+	resp, err := olaClient.CreateGeofence(body)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to create geofence", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusCreated, "Geofence created", resp)
+}
+
+// PUT /api/v1/user/ola/geofence/:id
+func UpdateGeofence(c *gin.Context) {
+	id := c.Param("id")
+	var body utils.GeofenceCreateRequest
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.RespondError(c, http.StatusBadRequest, "Invalid request body", err)
+		return
+	}
+
+	olaClient := utils.NewOlaMapsClient()
+	resp, err := olaClient.UpdateGeofence(id, body)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to update geofence", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Geofence updated", resp)
+}
+
+// GET /api/v1/user/ola/geofence/:id
+func GetGeofence(c *gin.Context) {
+	id := c.Param("id")
+	olaClient := utils.NewOlaMapsClient()
+	resp, err := olaClient.GetGeofence(id)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to get geofence", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Geofence details", resp)
+}
+
+// DELETE /api/v1/user/ola/geofence/:id
+func DeleteGeofence(c *gin.Context) {
+	id := c.Param("id")
+	olaClient := utils.NewOlaMapsClient()
+	err := olaClient.DeleteGeofence(id)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to delete geofence", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Geofence deleted", nil)
+}
+
+// GET /api/v1/user/ola/geofences
+func ListGeofences(c *gin.Context) {
+	projectId := c.Query("projectId")
+	if projectId == "" {
+		utils.RespondError(c, http.StatusBadRequest, "projectId is required", nil)
+		return
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	size, _ := strconv.Atoi(c.DefaultQuery("size", "10"))
+
+	olaClient := utils.NewOlaMapsClient()
+	resp, err := olaClient.ListGeofences(projectId, page, size)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to list geofences", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Geofences list", resp)
+}
+
+// GET /api/v1/user/ola/geofence/status
+func GetGeofenceStatus(c *gin.Context) {
+	geofenceId := c.Query("geofenceId")
+	lat, errLat := strconv.ParseFloat(c.Query("lat"), 64)
+	lng, errLng := strconv.ParseFloat(c.Query("lng"), 64)
+
+	if geofenceId == "" || errLat != nil || errLng != nil {
+		utils.RespondError(c, http.StatusBadRequest, "geofenceId, lat, and lng are required", nil)
+		return
+	}
+
+	olaClient := utils.NewOlaMapsClient()
+	resp, err := olaClient.GetGeofenceStatus(geofenceId, lat, lng)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to get geofence status", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Geofence status", resp)
+}
+
+// POST /api/v1/user/ola/route-optimizer
+func RouteOptimizer(c *gin.Context) {
+	var body struct {
+		Locations   string `json:"locations" binding:"required"` // Pipe separated lat,lng
+		Source      string `json:"source"`                       // "first" or "any"
+		Destination string `json:"destination"`                  // "last" or "any"
+		RoundTrip   bool   `json:"round_trip"`
+		Mode        string `json:"mode"` // "driving", "walking", etc.
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.RespondError(c, http.StatusBadRequest, "Invalid request body", err)
+		return
+	}
+
+	// Defaults
+	if body.Source == "" {
+		body.Source = "first"
+	}
+	if body.Destination == "" {
+		body.Destination = "last"
+	}
+	if body.Mode == "" {
+		body.Mode = "driving"
+	}
+
+	olaClient := utils.NewOlaMapsClient()
+	resp, err := olaClient.RouteOptimizer(body.Locations, body.Source, body.Destination, body.RoundTrip, body.Mode)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Route optimization failed", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Optimized route", resp)
+}
+
+// POST /api/v1/user/ola/fleet-planner
+func FleetPlanner(c *gin.Context) {
+	strategy := c.Query("strategy")
+	if strategy == "" {
+		strategy = "optimal"
+	}
+
+	file, _, err := c.Request.FormFile("input")
+	if err != nil {
+		utils.RespondError(c, http.StatusBadRequest, "input file is required", err)
+		return
+	}
+	defer file.Close()
+
+	inputBytes, err := io.ReadAll(file)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to read input file", err)
+		return
+	}
+
+	olaClient := utils.NewOlaMapsClient()
+	resp, err := olaClient.FleetPlanner(strategy, inputBytes)
+	if err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Fleet planning failed", err)
+		return
+	}
+
+	utils.RespondSuccess(c, http.StatusOK, "Fleet plan", resp)
+}
